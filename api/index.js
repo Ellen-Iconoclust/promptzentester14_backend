@@ -1,126 +1,64 @@
-const { createClient } = require('@libsql/client');
+const { Pool } = require('pg');
 const crypto = require('crypto');
 
-// Turso database configuration
-const tursoConfig = {
-  url: process.env.TURSO_DATABASE_URL || 'libsql://your-database.turso.io',
-  authToken: process.env.TURSO_AUTH_TOKEN || 'your-auth-token',
+// Neon PostgreSQL Configuration
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+// Test connection on startup
+const initializeDatabase = async () => {
+  try {
+    const client = await pool.connect();
+    console.log('✅ Connected to Neon PostgreSQL database');
+    client.release();
+  } catch (error) {
+    console.error('❌ Database connection failed:', error);
+    setTimeout(initializeDatabase, 5000);
+  }
 };
 
-// Initialize Turso client
-let db;
-try {
-  db = createClient({
-    url: tursoConfig.url,
-    authToken: tursoConfig.authToken,
-  });
-  console.log('Connected to Turso database');
-} catch (error) {
-  console.error('Turso connection error:', error);
-}
-
-// Initialize database tables
-async function initializeDatabase() {
-  try {
-    console.log('Initializing database tables...');
-    
-    // Users table - simplified for Turso compatibility
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        role TEXT DEFAULT 'user',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // Prompts table - simplified for Turso compatibility
-    await db.execute(`
-      CREATE TABLE IF NOT EXISTS prompts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
-        title TEXT NOT NULL,
-        tagline TEXT NOT NULL,
-        model TEXT NOT NULL,
-        text TEXT NOT NULL,
-        image_data TEXT,
-        image_filename TEXT,
-        image_type TEXT,
-        accepted INTEGER DEFAULT 0,
-        isTrending INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    console.log('Database tables created successfully');
-
-    // Check if we need to insert default data
-    const existingUsers = await db.execute('SELECT COUNT(*) as count FROM users');
-    if (existingUsers.rows[0].count === 0) {
-      console.log('Initializing database with default data...');
-      
-      // Insert default admin user
-      const adminPasswordHash = crypto.createHash('sha256').update('admin123').digest('hex');
-      await db.execute({
-        sql: 'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-        args: ['admin', adminPasswordHash, 'admin']
-      });
-
-      // Insert sample prompts
-      const samplePrompts = [
-        {
-          username: 'admin',
-          title: 'Cyberpunk Cityscape',
-          tagline: 'Futuristic neon-lit urban environment',
-          model: 'Midjourney',
-          text: 'Create a cyberpunk cityscape at night with neon lights, flying cars, and towering skyscrapers. Use vibrant colors like electric blue, hot pink, and neon green. Style: cinematic, detailed, 8k resolution --ar 16:9',
-          image_data: 'https://images.unsplash.com/photo-1487958449943-2429e8be8625?w=400&h=300&fit=crop',
-          accepted: 1,
-          isTrending: 1
-        },
-        {
-          username: 'admin',
-          title: 'Fantasy Dragon',
-          tagline: 'Majestic dragon in mystical landscape',
-          model: 'DALL-E',
-          text: 'A majestic dragon with iridescent scales flying over a mystical landscape with floating islands and waterfalls. Epic fantasy style, highly detailed, dramatic lighting --ar 3:2',
-          image_data: 'https://images.unsplash.com/photo-1518709268805-4e9042af2176?w=400&h=300&fit=crop',
-          accepted: 1,
-          isTrending: 1
-        }
-      ];
-
-      for (const prompt of samplePrompts) {
-        await db.execute({
-          sql: `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          args: [prompt.username, prompt.title, prompt.tagline, prompt.model, prompt.text, 
-                 prompt.image_data, prompt.accepted, prompt.isTrending]
-        });
-      }
-
-      console.log('Database initialized with admin user: admin / admin123 and sample prompts');
-    } else {
-      console.log('Using existing database with persistent data');
-    }
-  } catch (error) {
-    console.error('Database initialization error:', error);
-  }
-}
-
-// Initialize database on startup
 initializeDatabase();
 
-// Database helper functions
-const dbExecute = db.execute.bind(db);
-const dbGet = async (sql, args = []) => {
-  const result = await db.execute({ sql, args });
-  return result.rows[0] || null;
+// Database helper functions (maintaining same interface)
+const dbRun = async (sql, params = []) => {
+  try {
+    const result = await pool.query(sql, params);
+    return {
+      lastID: result.rows[0]?.id || result.rows[result.rowCount - 1]?.id,
+      changes: result.rowCount,
+      insertId: result.rows[0]?.id
+    };
+  } catch (error) {
+    console.error('Database run error:', error);
+    throw error;
+  }
 };
-const dbAll = async (sql, args = []) => {
-  const result = await db.execute({ sql, args });
-  return result.rows;
+
+const dbGet = async (sql, params = []) => {
+  try {
+    const result = await pool.query(sql, params);
+    return result.rows[0] || null;
+  } catch (error) {
+    console.error('Database get error:', error);
+    throw error;
+  }
+};
+
+const dbAll = async (sql, params = []) => {
+  try {
+    const result = await pool.query(sql, params);
+    return result.rows;
+  } catch (error) {
+    console.error('Database all error:', error);
+    throw error;
+  }
 };
 
 // CORS headers
@@ -143,12 +81,11 @@ module.exports = async (req, res) => {
   });
 
   try {
-    // Better path parsing for Vercel
     const url = new URL(req.url, `http://${req.headers.host}`);
     const path = url.pathname;
     console.log(`Incoming request: ${req.method} ${path}`);
     
-    // Route handling
+    // Route handling - EXACTLY THE SAME STRUCTURE
     if (req.method === 'POST' && path === '/api/register') {
       return await handleRegister(req, res);
     } else if (req.method === 'POST' && path === '/api/login') {
@@ -173,9 +110,9 @@ module.exports = async (req, res) => {
       return await handleBulkAction(req, res);
     } else if (req.method === 'GET' && path === '/') {
       return res.status(200).json({ 
-        message: 'PromptZen API is running!', 
+        message: 'PromptZen API is running with Neon PostgreSQL!', 
         status: 'success',
-        database: 'turso'
+        database: 'neon-postgresql'
       });
     } else {
       return res.status(404).json({ error: 'Route not found' });
@@ -186,7 +123,7 @@ module.exports = async (req, res) => {
   }
 };
 
-// JWT implementation
+// JWT implementation (UNCHANGED)
 const jwt = {
   sign: (payload, secret) => {
     const header = { alg: 'HS256', typ: 'JWT' };
@@ -219,12 +156,12 @@ const jwt = {
 
 const JWT_SECRET = process.env.JWT_SECRET || '484848484848484848484848484848484848484884848swkjhdjwbjhjdh3djbjd3484848484848484';
 
-// Password hashing
+// Password hashing (UNCHANGED)
 const hashPassword = (password) => {
   return crypto.createHash('sha256').update(password).digest('hex');
 };
 
-// Auth middleware
+// Auth middleware (UNCHANGED)
 const authenticateToken = (req) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -235,7 +172,7 @@ const authenticateToken = (req) => {
   return jwt.verify(token, JWT_SECRET);
 };
 
-// Route handlers
+// Route handlers (MINIMAL CHANGES FOR PostgreSQL SYNTAX)
 async function handleRegister(req, res) {
   try {
     const { username, password } = await parseBody(req);
@@ -255,7 +192,7 @@ async function handleRegister(req, res) {
     }
     
     // Check if user exists
-    const existingUser = await dbGet('SELECT * FROM users WHERE username = ?', [username]);
+    const existingUser = await dbGet('SELECT * FROM users WHERE username = $1', [username]);
     
     if (existingUser) {
       return res.status(400).json({ error: 'Username already exists' });
@@ -263,10 +200,10 @@ async function handleRegister(req, res) {
     
     // Create user
     const hashedPassword = hashPassword(password);
-    await dbExecute({
-      sql: 'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-      args: [username, hashedPassword, 'user']
-    });
+    const result = await dbRun(
+      'INSERT INTO users (username, password, role) VALUES ($1, $2, $3) RETURNING id',
+      [username, hashedPassword, 'user']
+    );
     
     // Create token
     const token = jwt.sign(
@@ -299,7 +236,7 @@ async function handleLogin(req, res) {
     console.log(`Login attempt for user: ${username}`);
     
     // Get user
-    const user = await dbGet('SELECT * FROM users WHERE username = ?', [username]);
+    const user = await dbGet('SELECT * FROM users WHERE username = $1', [username]);
     
     if (!user) {
       console.log('User not found:', username);
@@ -386,17 +323,16 @@ async function handleGetPrompts(req, res) {
     const publicOnly = url.searchParams.get('public') !== 'false';
     
     let query = 'SELECT * FROM prompts';
-    let args = [];
+    let params = [];
     
     if (publicOnly) {
-      query += ' WHERE accepted = ?';
-      args.push(1);
+      query += ' WHERE accepted = $1';
+      params.push(true);
     }
     
     query += ' ORDER BY created_at DESC';
     
-    const result = await dbExecute({ sql: query, args });
-    const prompts = result.rows;
+    const prompts = await dbAll(query, params);
     
     // Convert for frontend
     const processedPrompts = prompts.map(prompt => ({
@@ -421,11 +357,10 @@ async function handleGetPendingPrompts(req, res) {
       return res.status(403).json({ error: 'Admin access required' });
     }
     
-    const result = await dbExecute({
-      sql: 'SELECT * FROM prompts WHERE accepted = ? ORDER BY created_at DESC',
-      args: [0]
-    });
-    const prompts = result.rows;
+    const prompts = await dbAll(
+      'SELECT * FROM prompts WHERE accepted = $1 ORDER BY created_at DESC',
+      [false]
+    );
     
     // Convert for frontend
     const processedPrompts = prompts.map(prompt => ({
@@ -458,17 +393,20 @@ async function handleCreatePrompt(req, res) {
     console.log('Creating prompt for user:', user.username);
     console.log('Prompt data:', { title, tagline, model });
     
-    const result = await dbExecute({
-      sql: `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [user.username, title, tagline, model, text, imageData, user.role === 'admin' ? 1 : 0, 0]
-    });
+    const result = await dbRun(
+      `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [user.username, title, tagline, model, text, imageData, user.role === 'admin', false]
+    );
     
-    // Get the last inserted ID
-    const lastIdResult = await dbExecute('SELECT last_insert_rowid() as id');
-    const promptId = lastIdResult.rows[0].id;
+    console.log('Insert result:', result);
     
-    const newPrompt = await dbGet('SELECT * FROM prompts WHERE id = ?', [promptId]);
+    if (!result || !result.lastID) {
+      throw new Error('Failed to get prompt ID after insertion');
+    }
+    
+    // Get the created prompt
+    const newPrompt = await dbGet('SELECT * FROM prompts WHERE id = $1', [result.lastID]);
     
     if (!newPrompt) {
       throw new Error('Failed to retrieve created prompt');
@@ -508,14 +446,17 @@ async function handleUpdatePrompt(req, res) {
     // Build update query dynamically
     const updateFields = [];
     const updateValues = [];
+    let paramCount = 1;
     
     Object.keys(updates).forEach(key => {
       if (key === 'accepted' || key === 'isTrending') {
-        updateFields.push(`${key} = ?`);
-        updateValues.push(updates[key] ? 1 : 0);
-      } else if (key !== 'id') {
-        updateFields.push(`${key} = ?`);
+        updateFields.push(`${key} = $${paramCount}`);
         updateValues.push(updates[key]);
+        paramCount++;
+      } else if (key !== 'id') {
+        updateFields.push(`${key} = $${paramCount}`);
+        updateValues.push(updates[key]);
+        paramCount++;
       }
     });
     
@@ -525,12 +466,12 @@ async function handleUpdatePrompt(req, res) {
     
     updateValues.push(promptId);
     
-    await dbExecute({
-      sql: `UPDATE prompts SET ${updateFields.join(', ')} WHERE id = ?`,
-      args: updateValues
-    });
+    await dbRun(
+      `UPDATE prompts SET ${updateFields.join(', ')} WHERE id = $${paramCount}`,
+      updateValues
+    );
     
-    const updatedPrompt = await dbGet('SELECT * FROM prompts WHERE id = ?', [promptId]);
+    const updatedPrompt = await dbGet('SELECT * FROM prompts WHERE id = $1', [promptId]);
     
     if (!updatedPrompt) {
       return res.status(404).json({ error: 'Prompt not found' });
@@ -560,10 +501,7 @@ async function handleDeletePrompt(req, res) {
     
     const promptId = req.url.split('/').pop();
     
-    await dbExecute({
-      sql: 'DELETE FROM prompts WHERE id = ?',
-      args: [promptId]
-    });
+    await dbRun('DELETE FROM prompts WHERE id = $1', [promptId]);
     
     return res.json({ message: 'Prompt deleted successfully' });
   } catch (error) {
@@ -579,10 +517,8 @@ async function handleAdminStats(req, res) {
       return res.status(403).json({ error: 'Admin access required' });
     }
     
-    const promptsResult = await dbExecute('SELECT * FROM prompts');
-    const prompts = promptsResult.rows;
-    const usersResult = await dbExecute('SELECT username FROM users');
-    const users = usersResult.rows;
+    const prompts = await dbAll('SELECT * FROM prompts');
+    const users = await dbAll('SELECT username FROM users');
     
     const totalPrompts = prompts.length;
     const acceptedPrompts = prompts.filter(p => p.accepted).length;
@@ -604,11 +540,7 @@ async function handleAdminStats(req, res) {
 
 async function handlePublicStats(req, res) {
   try {
-    const result = await dbExecute({
-      sql: 'SELECT * FROM prompts WHERE accepted = ?',
-      args: [1]
-    });
-    const prompts = result.rows;
+    const prompts = await dbAll('SELECT * FROM prompts WHERE accepted = $1', [true]);
     
     const acceptedPrompts = prompts || [];
     const uniqueUsers = new Set(acceptedPrompts.map(p => p.username));
@@ -640,16 +572,17 @@ async function handleBulkAction(req, res) {
       return res.status(400).json({ error: 'Invalid request' });
     }
     
+    let result;
     if (action === 'approve') {
-      await dbExecute({
-        sql: 'UPDATE prompts SET accepted = ? WHERE id IN (' + prompt_ids.map(() => '?').join(',') + ')',
-        args: [1, ...prompt_ids]
-      });
+      result = await dbRun(
+        'UPDATE prompts SET accepted = $1 WHERE id = ANY($2)',
+        [true, prompt_ids]
+      );
     } else if (action === 'reject') {
-      await dbExecute({
-        sql: 'DELETE FROM prompts WHERE id IN (' + prompt_ids.map(() => '?').join(',') + ')',
-        args: prompt_ids
-      });
+      result = await dbRun(
+        'DELETE FROM prompts WHERE id = ANY($1)',
+        [prompt_ids]
+      );
     }
     
     return res.json({
@@ -661,7 +594,7 @@ async function handleBulkAction(req, res) {
   }
 }
 
-// Helper function to parse request body
+// Helper function to parse request body (UNCHANGED)
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
