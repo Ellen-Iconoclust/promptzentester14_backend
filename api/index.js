@@ -22,18 +22,20 @@ try {
 // Initialize database tables
 async function initializeDatabase() {
   try {
-    // Users table
+    console.log('Initializing database tables...');
+    
+    // Users table - simplified for Turso compatibility
     await db.execute(`
       CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL,
         role TEXT DEFAULT 'user',
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
-    // Prompts table
+    // Prompts table - simplified for Turso compatibility
     await db.execute(`
       CREATE TABLE IF NOT EXISTS prompts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,11 +47,13 @@ async function initializeDatabase() {
         image_data TEXT,
         image_filename TEXT,
         image_type TEXT,
-        accepted BOOLEAN DEFAULT 0,
-        isTrending BOOLEAN DEFAULT 0,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        accepted INTEGER DEFAULT 0,
+        isTrending INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    console.log('Database tables created successfully');
 
     // Check if we need to insert default data
     const existingUsers = await db.execute('SELECT COUNT(*) as count FROM users');
@@ -59,7 +63,7 @@ async function initializeDatabase() {
       // Insert default admin user
       const adminPasswordHash = crypto.createHash('sha256').update('admin123').digest('hex');
       await db.execute({
-        sql: 'INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)',
+        sql: 'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
         args: ['admin', adminPasswordHash, 'admin']
       });
 
@@ -89,7 +93,7 @@ async function initializeDatabase() {
 
       for (const prompt of samplePrompts) {
         await db.execute({
-          sql: `INSERT OR IGNORE INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
+          sql: `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [prompt.username, prompt.title, prompt.tagline, prompt.model, prompt.text, 
                  prompt.image_data, prompt.accepted, prompt.isTrending]
@@ -460,9 +464,9 @@ async function handleCreatePrompt(req, res) {
       args: [user.username, title, tagline, model, text, imageData, user.role === 'admin' ? 1 : 0, 0]
     });
     
-    // Get the created prompt (Turso doesn't return lastID directly, so we query for it)
-    const lastInsertResult = await dbExecute('SELECT last_insert_rowid() as id');
-    const promptId = lastInsertResult.rows[0].id;
+    // Get the last inserted ID
+    const lastIdResult = await dbExecute('SELECT last_insert_rowid() as id');
+    const promptId = lastIdResult.rows[0].id;
     
     const newPrompt = await dbGet('SELECT * FROM prompts WHERE id = ?', [promptId]);
     
