@@ -1,1 +1,648 @@
+const { createClient } = require('@libsql/client');
+const crypto = require('crypto');
+const { promisify } = require('util');
 
+// Initialize Turso database connection
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || 'file:local.db', // fallback for local
+  authToken: process.env.TURSO_AUTH_TOKEN || undefined,
+});
+
+// Helper wrappers for queries
+const dbRun = async (sql, params = []) => {
+  try {
+    const result = await db.execute({ sql, args: params });
+    return { lastID: result.lastInsertRowid, changes: result.rowsAffected };
+  } catch (error) {
+    console.error('DB Run Error:', error);
+    throw error;
+  }
+};
+
+const dbGet = async (sql, params = []) => {
+  const result = await db.execute({ sql, args: params });
+  return result.rows[0] || null;
+};
+
+const dbAll = async (sql, params = []) => {
+  const result = await db.execute({ sql, args: params });
+  return result.rows || [];
+};
+
+// Initialize tables (runs only once)
+async function initDatabase() {
+  await dbRun(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role TEXT DEFAULT 'user',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  await dbRun(`CREATE TABLE IF NOT EXISTS prompts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    title TEXT NOT NULL,
+    tagline TEXT NOT NULL,
+    model TEXT NOT NULL,
+    text TEXT NOT NULL,
+    image_data TEXT,
+    image_filename TEXT,
+    image_type TEXT,
+    accepted BOOLEAN DEFAULT 0,
+    isTrending BOOLEAN DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  const admin = await dbGet(`SELECT * FROM users WHERE username = ?`, ['admin']);
+  if (!admin) {
+    const adminPasswordHash = crypto.createHash('sha256').update('admin123').digest('hex');
+    await dbRun(
+      `INSERT INTO users (username, password, role) VALUES (?, ?, ?)`,
+      ['admin', adminPasswordHash, 'admin']
+    );
+
+    const samplePrompts = [
+      {
+        username: 'admin',
+        title: 'Cyberpunk Cityscape',
+        tagline: 'Futuristic neon-lit urban environment',
+        model: 'Midjourney',
+        text: 'Create a cyberpunk cityscape at night with neon lights, flying cars, and towering skyscrapers. Use vibrant colors like electric blue, hot pink, and neon green. Style: cinematic, detailed, 8k resolution --ar 16:9',
+        image_data: 'https://images.unsplash.com/photo-1487958449943-2429e8be8625?w=400&h=300&fit=crop',
+        accepted: 1,
+        isTrending: 1,
+      },
+      {
+        username: 'admin',
+        title: 'Fantasy Dragon',
+        tagline: 'Majestic dragon in mystical landscape',
+        model: 'DALL-E',
+        text: 'A majestic dragon with iridescent scales flying over a mystical landscape with floating islands and waterfalls. Epic fantasy style, highly detailed, dramatic lighting --ar 3:2',
+        image_data: 'https://images.unsplash.com/photo-1518709268805-4e9042af2176?w=400&h=300&fit=crop',
+        accepted: 1,
+        isTrending: 1,
+      },
+    ];
+
+    for (const prompt of samplePrompts) {
+      await dbRun(
+        `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          prompt.username,
+          prompt.title,
+          prompt.tagline,
+          prompt.model,
+          prompt.text,
+          prompt.image_data,
+          prompt.accepted,
+          prompt.isTrending,
+        ]
+      );
+    }
+
+    console.log('✅ Turso database initialized with admin and sample prompts');
+  } else {
+    console.log('✅ Using existing Turso database');
+  }
+}
+initDatabase().catch(console.error);
+
+// JWT implementation
+const jwt = {
+  sign: (payload, secret) => {
+    const header = { alg: 'HS256', typ: 'JWT' };
+    const encodedHeader = Buffer.from(JSON.stringify(header)).toString('base64url');
+    const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const signature = crypto
+      .createHmac('sha256', secret)
+      .update(`${encodedHeader}.${encodedPayload}`)
+      .digest('base64url');
+    return `${encodedHeader}.${encodedPayload}.${signature}`;
+  },
+  verify: (token, secret) => {
+    try {
+      const [encodedHeader, encodedPayload, signature] = token.split('.');
+      const expectedSignature = crypto
+        .createHmac('sha256', secret)
+        .update(`${encodedHeader}.${encodedPayload}`)
+        .digest('base64url');
+      if (signature !== expectedSignature) throw new Error('Invalid token');
+      return JSON.parse(Buffer.from(encodedPayload, 'base64url').toString());
+    } catch {
+      throw new Error('Invalid token');
+    }
+  },
+};
+
+const JWT_SECRET =
+  process.env.JWT_SECRET ||
+  '484848484848484848484848484848484848484884848swkjhdjwbjhjdh3djbjd3484848484848484';
+
+const hashPassword = (password) =>
+  crypto.createHash('sha256').update(password).digest('hex');
+
+const authenticateToken = (req) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer '))
+    throw new Error('No token provided');
+  const token = authHeader.split(' ')[1];
+  return jwt.verify(token, JWT_SECRET);
+};
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-requested-with',
+};
+
+module.exports = async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200, corsHeaders);
+    return res.end();
+  }
+  Object.entries(corsHeaders).forEach(([k, v]) => res.setHeader(k, v));
+
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const path = url.pathname;
+
+    if (req.method === 'POST' && path === '/api/register')
+      return await handleRegister(req, res);
+    if (req.method === 'POST' && path === '/api/login')
+      return await handleLogin(req, res);
+    if (req.method === 'GET' && path === '/api/prompts')
+      return await handleGetPrompts(req, res);
+    if (req.method === 'GET' && path === '/api/prompts/pending')
+      return await handleGetPendingPrompts(req, res);
+    if (req.method === 'POST' && path === '/api/prompts')
+      return await handleCreatePrompt(req, res);
+    if (req.method === 'POST' && path === '/api/upload')
+      return await handleFileUpload(req, res);
+    if (req.method === 'PUT' && path.startsWith('/api/prompts/'))
+      return await handleUpdatePrompt(req, res);
+    if (req.method === 'DELETE' && path.startsWith('/api/prompts/'))
+      return await handleDeletePrompt(req, res);
+    if (req.method === 'GET' && path === '/api/admin/stats')
+      return await handleAdminStats(req, res);
+    if (req.method === 'GET' && path === '/api/stats')
+      return await handlePublicStats(req, res);
+    if (req.method === 'POST' && path === '/api/admin/prompts/bulk-action')
+      return await handleBulkAction(req, res);
+    if (req.method === 'GET' && path === '/')
+      return res.status(200).json({
+        message: 'PromptZen API running with Turso!',
+        status: 'success',
+        database: 'turso',
+      });
+
+    return res.status(404).json({ error: 'Route not found' });
+  } catch (error) {
+    console.error('Server error:', error);
+    return res.status(500).json({ error: 'Internal error: ' + error.message });
+  }
+};
+
+// === Route handlers (same as your original) ===
+// (copy-paste your handleRegister, handleLogin, handleFileUpload, handleGetPrompts,
+// handleGetPendingPrompts, handleCreatePrompt, handleUpdatePrompt,
+// handleDeletePrompt, handleAdminStats, handlePublicStats, handleBulkAction,
+// and parseBody exactly as they are — no changes needed.)
+async function handleRegister(req, res) {
+  try {
+    const { username, password } = await parseBody(req);
+    
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password required' });
+    }
+    
+    // Validate username
+    if (!username.match(/^[a-zA-Z0-9]{3,20}$/)) {
+      return res.status(400).json({ error: 'Username must be 3-20 alphanumeric characters' });
+    }
+    
+    // Validate password
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    
+    // Check if user exists
+    const existingUser = await dbGet('SELECT * FROM users WHERE username = ?', [username]);
+    
+    if (existingUser) {
+      return res.status(400).json({ error: 'Username already exists' });
+    }
+    
+    // Create user
+    const hashedPassword = hashPassword(password);
+    const result = await dbRun(
+      'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+      [username, hashedPassword, 'user']
+    );
+    
+    // Create token
+    const token = jwt.sign(
+      { username: username, role: 'user' },
+      JWT_SECRET
+    );
+    
+    console.log(`User registered successfully: ${username}`);
+    
+    return res.status(201).json({
+      access_token: token,
+      username: username,
+      role: 'user',
+      message: 'Registration successful'
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    return res.status(500).json({ error: 'Registration failed: ' + error.message });
+  }
+}
+
+async function handleLogin(req, res) {
+  try {
+    const { username, password } = await parseBody(req);
+    
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password required' });
+    }
+    
+    console.log(`Login attempt for user: ${username}`);
+    
+    // Get user
+    const user = await dbGet('SELECT * FROM users WHERE username = ?', [username]);
+    
+    if (!user) {
+      console.log('User not found:', username);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Check password
+    const hashedPassword = hashPassword(password);
+    const isPasswordValid = (hashedPassword === user.password);
+    
+    console.log('Password check:', { 
+      username, 
+      providedHash: hashedPassword, 
+      storedHash: user.password,
+      isValid: isPasswordValid 
+    });
+    
+    if (!isPasswordValid) {
+      console.log('Password mismatch for user:', username);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Create token
+    const token = jwt.sign(
+      { username: user.username, role: user.role },
+      JWT_SECRET
+    );
+    
+    console.log(`Login successful for user: ${username}, role: ${user.role}`);
+    
+    return res.json({
+      access_token: token,
+      username: user.username,
+      role: user.role,
+      message: 'Login successful'
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    return res.status(500).json({ error: 'Login failed: ' + error.message });
+  }
+}
+
+async function handleFileUpload(req, res) {
+  try {
+    const user = authenticateToken(req);
+    
+    const body = await parseBody(req);
+    const { file: base64File, filename, filetype } = body;
+    
+    if (!base64File || !filename) {
+      return res.status(400).json({ error: 'File data required' });
+    }
+    
+    // Remove data URL prefix if present
+    const base64Data = base64File.replace(/^data:image\/\w+;base64,/, '');
+    
+    // Validate file size (5MB limit)
+    if (base64Data.length > 7 * 1024 * 1024) {
+      return res.status(400).json({ error: 'File size must be less than 5MB' });
+    }
+    
+    // Generate unique filename
+    const fileExt = filename.split('.').pop() || 'jpg';
+    const uniqueFilename = `${user.username}_${Date.now()}.${fileExt}`;
+    
+    return res.json({
+      url: `data:${filetype || 'image/jpeg'};base64,${base64Data}`,
+      filename: uniqueFilename,
+      message: 'File processed successfully'
+    });
+    
+  } catch (error) {
+    console.error('File upload error:', error);
+    if (error.message === 'Invalid token') {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    return res.status(500).json({ error: 'File upload failed: ' + error.message });
+  }
+}
+
+async function handleGetPrompts(req, res) {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const publicOnly = url.searchParams.get('public') !== 'false';
+    
+    let query = 'SELECT * FROM prompts';
+    let params = [];
+    
+    if (publicOnly) {
+      query += ' WHERE accepted = ?';
+      params.push(1);
+    }
+    
+    query += ' ORDER BY created_at DESC';
+    
+    const prompts = await dbAll(query, params);
+    
+    // Convert for frontend
+    const processedPrompts = prompts.map(prompt => ({
+      ...prompt,
+      image_url: prompt.image_data || null,
+      accepted: Boolean(prompt.accepted),
+      isTrending: Boolean(prompt.isTrending)
+    }));
+    
+    return res.json(processedPrompts);
+  } catch (error) {
+    console.error('Error fetching prompts:', error);
+    return res.status(500).json({ error: 'Failed to fetch prompts' });
+  }
+}
+
+async function handleGetPendingPrompts(req, res) {
+  try {
+    const user = authenticateToken(req);
+    
+    if (user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    const prompts = await dbAll(
+      'SELECT * FROM prompts WHERE accepted = ? ORDER BY created_at DESC',
+      [0]
+    );
+    
+    // Convert for frontend
+    const processedPrompts = prompts.map(prompt => ({
+      ...prompt,
+      image_url: prompt.image_data || null,
+      accepted: Boolean(prompt.accepted),
+      isTrending: Boolean(prompt.isTrending)
+    }));
+    
+    return res.json(processedPrompts);
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+async function handleCreatePrompt(req, res) {
+  try {
+    const user = authenticateToken(req);
+    const body = await parseBody(req);
+    
+    const { title, tagline, model, text, image_url } = body;
+    
+    if (!title || !tagline || !model || !text) {
+      return res.status(422).json({ error: 'All fields are required' });
+    }
+    
+    // Store image as base64 in database
+    const imageData = image_url || null;
+    
+    console.log('Creating prompt for user:', user.username);
+    console.log('Prompt data:', { title, tagline, model });
+    
+    // ✅ FIXED: Use our custom dbRun that properly returns lastID
+    const result = await dbRun(
+      `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [user.username, title, tagline, model, text, imageData, user.role === 'admin' ? 1 : 0, 0]
+    );
+    
+    console.log('Insert result:', result);
+    
+    // ✅ FIXED: Check if we got a valid lastID
+    if (!result || result.lastID === undefined || result.lastID === null) {
+      throw new Error('Failed to get prompt ID after insertion');
+    }
+    
+    // Get the created prompt
+    const newPrompt = await dbGet('SELECT * FROM prompts WHERE id = ?', [result.lastID]);
+    
+    if (!newPrompt) {
+      throw new Error('Failed to retrieve created prompt');
+    }
+    
+    // Convert for response
+    const processedPrompt = {
+      ...newPrompt,
+      image_url: newPrompt.image_data || null,
+      accepted: Boolean(newPrompt.accepted),
+      isTrending: Boolean(newPrompt.isTrending)
+    };
+    
+    console.log('Created prompt successfully:', processedPrompt.id);
+    
+    return res.status(201).json(processedPrompt);
+  } catch (error) {
+    console.error('Create prompt error:', error);
+    if (error.message === 'Invalid token' || error.message === 'No token provided') {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    return res.status(500).json({ error: 'Failed to create prompt: ' + error.message });
+  }
+}
+
+async function handleUpdatePrompt(req, res) {
+  try {
+    const user = authenticateToken(req);
+    
+    if (user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    const promptId = req.url.split('/').pop();
+    const updates = await parseBody(req);
+    
+    // Build update query dynamically
+    const updateFields = [];
+    const updateValues = [];
+    
+    Object.keys(updates).forEach(key => {
+      if (key === 'accepted' || key === 'isTrending') {
+        updateFields.push(`${key} = ?`);
+        updateValues.push(updates[key] ? 1 : 0);
+      } else if (key !== 'id') {
+        updateFields.push(`${key} = ?`);
+        updateValues.push(updates[key]);
+      }
+    });
+    
+    if (updateFields.length === 0) {
+      return res.status(400).json({ error: 'No valid fields to update' });
+    }
+    
+    updateValues.push(promptId);
+    
+    await dbRun(
+      `UPDATE prompts SET ${updateFields.join(', ')} WHERE id = ?`,
+      updateValues
+    );
+    
+    const updatedPrompt = await dbGet('SELECT * FROM prompts WHERE id = ?', [promptId]);
+    
+    if (!updatedPrompt) {
+      return res.status(404).json({ error: 'Prompt not found' });
+    }
+    
+    // Convert for response
+    const processedPrompt = {
+      ...updatedPrompt,
+      image_url: updatedPrompt.image_data || null,
+      accepted: Boolean(updatedPrompt.accepted),
+      isTrending: Boolean(updatedPrompt.isTrending)
+    };
+    
+    return res.json(processedPrompt);
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+async function handleDeletePrompt(req, res) {
+  try {
+    const user = authenticateToken(req);
+    
+    if (user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    const promptId = req.url.split('/').pop();
+    
+    await dbRun('DELETE FROM prompts WHERE id = ?', [promptId]);
+    
+    return res.json({ message: 'Prompt deleted successfully' });
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+async function handleAdminStats(req, res) {
+  try {
+    const user = authenticateToken(req);
+    
+    if (user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    const prompts = await dbAll('SELECT * FROM prompts');
+    const users = await dbAll('SELECT username FROM users');
+    
+    const totalPrompts = prompts.length;
+    const acceptedPrompts = prompts.filter(p => p.accepted).length;
+    const pendingPrompts = prompts.filter(p => !p.accepted).length;
+    const trendingPrompts = prompts.filter(p => p.isTrending && p.accepted).length;
+    const totalUsers = new Set(prompts.map(p => p.username)).size;
+    
+    return res.json({
+      total_prompts: totalPrompts,
+      accepted_prompts: acceptedPrompts,
+      pending_prompts: pendingPrompts,
+      trending_prompts: trendingPrompts,
+      total_users: totalUsers
+    });
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+async function handlePublicStats(req, res) {
+  try {
+    const prompts = await dbAll('SELECT * FROM prompts WHERE accepted = ?', [1]);
+    
+    const acceptedPrompts = prompts || [];
+    const uniqueUsers = new Set(acceptedPrompts.map(p => p.username));
+    const trendingPrompts = acceptedPrompts.filter(p => p.isTrending);
+    
+    return res.json({
+      total_prompts: acceptedPrompts.length,
+      total_users: uniqueUsers.size,
+      trending_prompts: trendingPrompts.length,
+      categories: 0
+    });
+  } catch (error) {
+    console.error('Error fetching public stats:', error);
+    return res.status(500).json({ error: 'Failed to fetch stats' });
+  }
+}
+
+async function handleBulkAction(req, res) {
+  try {
+    const user = authenticateToken(req);
+    
+    if (user.role !== 'admin') {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    const { prompt_ids, action } = await parseBody(req);
+    
+    if (!prompt_ids || !Array.isArray(prompt_ids) || !['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ error: 'Invalid request' });
+    }
+    
+    let result;
+    if (action === 'approve') {
+      result = await dbRun(
+        'UPDATE prompts SET accepted = ? WHERE id IN (' + prompt_ids.map(() => '?').join(',') + ')',
+        [1, ...prompt_ids]
+      );
+    } else if (action === 'reject') {
+      result = await dbRun(
+        'DELETE FROM prompts WHERE id IN (' + prompt_ids.map(() => '?').join(',') + ')',
+        prompt_ids
+      );
+    }
+    
+    return res.json({
+      message: `Successfully ${action}d ${prompt_ids.length} prompts`,
+      updated_count: prompt_ids.length
+    });
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+// Helper function to parse request body
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (error) {
+        reject(new Error('Invalid JSON'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
