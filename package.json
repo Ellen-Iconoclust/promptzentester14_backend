@@ -1,0 +1,19 @@
+{
+  "name": "promptzen-backend",
+  "version": "1.0.0",
+  "description": "Serverless backend for PromptZen hosted on Vercel",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5",
+    "sqlite3": "^5.1.6",
+    "better-sqlite3": "^9.4.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}
