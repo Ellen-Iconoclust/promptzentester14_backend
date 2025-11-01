@@ -1,113 +1,186 @@
 const { createClient } = require('@libsql/client');
 const crypto = require('crypto');
-const { promisify } = require('util');
 
-// Initialize Turso database connection
-const db = createClient({
-  url: process.env.TURSO_DATABASE_URL || 'file:local.db', // fallback for local
-  authToken: process.env.TURSO_AUTH_TOKEN || undefined,
-});
+// Turso database configuration
+const tursoConfig = {
+  url: process.env.TURSO_DATABASE_URL || 'libsql://your-database.turso.io',
+  authToken: process.env.TURSO_AUTH_TOKEN || 'your-auth-token',
+};
 
-// Helper wrappers for queries
-const dbRun = async (sql, params = []) => {
+// Initialize Turso client
+let db;
+try {
+  db = createClient({
+    url: tursoConfig.url,
+    authToken: tursoConfig.authToken,
+  });
+  console.log('Connected to Turso database');
+} catch (error) {
+  console.error('Turso connection error:', error);
+}
+
+// Initialize database tables
+async function initializeDatabase() {
   try {
-    const result = await db.execute({ sql, args: params });
-    return { lastID: result.lastInsertRowid, changes: result.rowsAffected };
-  } catch (error) {
-    console.error('DB Run Error:', error);
-    throw error;
-  }
-};
+    // Users table
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        role TEXT DEFAULT 'user',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-const dbGet = async (sql, params = []) => {
-  const result = await db.execute({ sql, args: params });
-  return result.rows[0] || null;
-};
+    // Prompts table
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS prompts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        title TEXT NOT NULL,
+        tagline TEXT NOT NULL,
+        model TEXT NOT NULL,
+        text TEXT NOT NULL,
+        image_data TEXT,
+        image_filename TEXT,
+        image_type TEXT,
+        accepted BOOLEAN DEFAULT 0,
+        isTrending BOOLEAN DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-const dbAll = async (sql, params = []) => {
-  const result = await db.execute({ sql, args: params });
-  return result.rows || [];
-};
+    // Check if we need to insert default data
+    const existingUsers = await db.execute('SELECT COUNT(*) as count FROM users');
+    if (existingUsers.rows[0].count === 0) {
+      console.log('Initializing database with default data...');
+      
+      // Insert default admin user
+      const adminPasswordHash = crypto.createHash('sha256').update('admin123').digest('hex');
+      await db.execute({
+        sql: 'INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)',
+        args: ['admin', adminPasswordHash, 'admin']
+      });
 
-// Initialize tables (runs only once)
-async function initDatabase() {
-  await dbRun(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    role TEXT DEFAULT 'user',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+      // Insert sample prompts
+      const samplePrompts = [
+        {
+          username: 'admin',
+          title: 'Cyberpunk Cityscape',
+          tagline: 'Futuristic neon-lit urban environment',
+          model: 'Midjourney',
+          text: 'Create a cyberpunk cityscape at night with neon lights, flying cars, and towering skyscrapers. Use vibrant colors like electric blue, hot pink, and neon green. Style: cinematic, detailed, 8k resolution --ar 16:9',
+          image_data: 'https://images.unsplash.com/photo-1487958449943-2429e8be8625?w=400&h=300&fit=crop',
+          accepted: 1,
+          isTrending: 1
+        },
+        {
+          username: 'admin',
+          title: 'Fantasy Dragon',
+          tagline: 'Majestic dragon in mystical landscape',
+          model: 'DALL-E',
+          text: 'A majestic dragon with iridescent scales flying over a mystical landscape with floating islands and waterfalls. Epic fantasy style, highly detailed, dramatic lighting --ar 3:2',
+          image_data: 'https://images.unsplash.com/photo-1518709268805-4e9042af2176?w=400&h=300&fit=crop',
+          accepted: 1,
+          isTrending: 1
+        }
+      ];
 
-  await dbRun(`CREATE TABLE IF NOT EXISTS prompts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL,
-    title TEXT NOT NULL,
-    tagline TEXT NOT NULL,
-    model TEXT NOT NULL,
-    text TEXT NOT NULL,
-    image_data TEXT,
-    image_filename TEXT,
-    image_type TEXT,
-    accepted BOOLEAN DEFAULT 0,
-    isTrending BOOLEAN DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+      for (const prompt of samplePrompts) {
+        await db.execute({
+          sql: `INSERT OR IGNORE INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [prompt.username, prompt.title, prompt.tagline, prompt.model, prompt.text, 
+                 prompt.image_data, prompt.accepted, prompt.isTrending]
+        });
+      }
 
-  const admin = await dbGet(`SELECT * FROM users WHERE username = ?`, ['admin']);
-  if (!admin) {
-    const adminPasswordHash = crypto.createHash('sha256').update('admin123').digest('hex');
-    await dbRun(
-      `INSERT INTO users (username, password, role) VALUES (?, ?, ?)`,
-      ['admin', adminPasswordHash, 'admin']
-    );
-
-    const samplePrompts = [
-      {
-        username: 'admin',
-        title: 'Cyberpunk Cityscape',
-        tagline: 'Futuristic neon-lit urban environment',
-        model: 'Midjourney',
-        text: 'Create a cyberpunk cityscape at night with neon lights, flying cars, and towering skyscrapers. Use vibrant colors like electric blue, hot pink, and neon green. Style: cinematic, detailed, 8k resolution --ar 16:9',
-        image_data: 'https://images.unsplash.com/photo-1487958449943-2429e8be8625?w=400&h=300&fit=crop',
-        accepted: 1,
-        isTrending: 1,
-      },
-      {
-        username: 'admin',
-        title: 'Fantasy Dragon',
-        tagline: 'Majestic dragon in mystical landscape',
-        model: 'DALL-E',
-        text: 'A majestic dragon with iridescent scales flying over a mystical landscape with floating islands and waterfalls. Epic fantasy style, highly detailed, dramatic lighting --ar 3:2',
-        image_data: 'https://images.unsplash.com/photo-1518709268805-4e9042af2176?w=400&h=300&fit=crop',
-        accepted: 1,
-        isTrending: 1,
-      },
-    ];
-
-    for (const prompt of samplePrompts) {
-      await dbRun(
-        `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          prompt.username,
-          prompt.title,
-          prompt.tagline,
-          prompt.model,
-          prompt.text,
-          prompt.image_data,
-          prompt.accepted,
-          prompt.isTrending,
-        ]
-      );
+      console.log('Database initialized with admin user: admin / admin123 and sample prompts');
+    } else {
+      console.log('Using existing database with persistent data');
     }
-
-    console.log('✅ Turso database initialized with admin and sample prompts');
-  } else {
-    console.log('✅ Using existing Turso database');
+  } catch (error) {
+    console.error('Database initialization error:', error);
   }
 }
-initDatabase().catch(console.error);
+
+// Initialize database on startup
+initializeDatabase();
+
+// Database helper functions
+const dbExecute = db.execute.bind(db);
+const dbGet = async (sql, args = []) => {
+  const result = await db.execute({ sql, args });
+  return result.rows[0] || null;
+};
+const dbAll = async (sql, args = []) => {
+  const result = await db.execute({ sql, args });
+  return result.rows;
+};
+
+// CORS headers
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-requested-with',
+};
+
+module.exports = async (req, res) => {
+  // Handle CORS preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200, corsHeaders);
+    return res.end();
+  }
+
+  // Set CORS headers for all responses
+  Object.entries(corsHeaders).forEach(([key, value]) => {
+    res.setHeader(key, value);
+  });
+
+  try {
+    // Better path parsing for Vercel
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const path = url.pathname;
+    console.log(`Incoming request: ${req.method} ${path}`);
+    
+    // Route handling
+    if (req.method === 'POST' && path === '/api/register') {
+      return await handleRegister(req, res);
+    } else if (req.method === 'POST' && path === '/api/login') {
+      return await handleLogin(req, res);
+    } else if (req.method === 'GET' && path === '/api/prompts') {
+      return await handleGetPrompts(req, res);
+    } else if (req.method === 'GET' && path === '/api/prompts/pending') {
+      return await handleGetPendingPrompts(req, res);
+    } else if (req.method === 'POST' && path === '/api/prompts') {
+      return await handleCreatePrompt(req, res);
+    } else if (req.method === 'POST' && path === '/api/upload') {
+      return await handleFileUpload(req, res);
+    } else if (req.method === 'PUT' && path.startsWith('/api/prompts/')) {
+      return await handleUpdatePrompt(req, res);
+    } else if (req.method === 'DELETE' && path.startsWith('/api/prompts/')) {
+      return await handleDeletePrompt(req, res);
+    } else if (req.method === 'GET' && path === '/api/admin/stats') {
+      return await handleAdminStats(req, res);
+    } else if (req.method === 'GET' && path === '/api/stats') {
+      return await handlePublicStats(req, res);
+    } else if (req.method === 'POST' && path === '/api/admin/prompts/bulk-action') {
+      return await handleBulkAction(req, res);
+    } else if (req.method === 'GET' && path === '/') {
+      return res.status(200).json({ 
+        message: 'PromptZen API is running!', 
+        status: 'success',
+        database: 'turso'
+      });
+    } else {
+      return res.status(404).json({ error: 'Route not found' });
+    }
+  } catch (error) {
+    console.error('Server error:', error);
+    return res.status(500).json({ error: 'Internal server error: ' + error.message });
+  }
+};
 
 // JWT implementation
 const jwt = {
@@ -128,87 +201,37 @@ const jwt = {
         .createHmac('sha256', secret)
         .update(`${encodedHeader}.${encodedPayload}`)
         .digest('base64url');
-      if (signature !== expectedSignature) throw new Error('Invalid token');
+      
+      if (signature !== expectedSignature) {
+        throw new Error('Invalid token signature');
+      }
+      
       return JSON.parse(Buffer.from(encodedPayload, 'base64url').toString());
-    } catch {
+    } catch (error) {
       throw new Error('Invalid token');
     }
-  },
+  }
 };
 
-const JWT_SECRET =
-  process.env.JWT_SECRET ||
-  '484848484848484848484848484848484848484884848swkjhdjwbjhjdh3djbjd3484848484848484';
+const JWT_SECRET = process.env.JWT_SECRET || '484848484848484848484848484848484848484884848swkjhdjwbjhjdh3djbjd3484848484848484';
 
-const hashPassword = (password) =>
-  crypto.createHash('sha256').update(password).digest('hex');
+// Password hashing
+const hashPassword = (password) => {
+  return crypto.createHash('sha256').update(password).digest('hex');
+};
 
+// Auth middleware
 const authenticateToken = (req) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer '))
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
     throw new Error('No token provided');
+  }
+  
   const token = authHeader.split(' ')[1];
   return jwt.verify(token, JWT_SECRET);
 };
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-requested-with',
-};
-
-module.exports = async (req, res) => {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200, corsHeaders);
-    return res.end();
-  }
-  Object.entries(corsHeaders).forEach(([k, v]) => res.setHeader(k, v));
-
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const path = url.pathname;
-
-    if (req.method === 'POST' && path === '/api/register')
-      return await handleRegister(req, res);
-    if (req.method === 'POST' && path === '/api/login')
-      return await handleLogin(req, res);
-    if (req.method === 'GET' && path === '/api/prompts')
-      return await handleGetPrompts(req, res);
-    if (req.method === 'GET' && path === '/api/prompts/pending')
-      return await handleGetPendingPrompts(req, res);
-    if (req.method === 'POST' && path === '/api/prompts')
-      return await handleCreatePrompt(req, res);
-    if (req.method === 'POST' && path === '/api/upload')
-      return await handleFileUpload(req, res);
-    if (req.method === 'PUT' && path.startsWith('/api/prompts/'))
-      return await handleUpdatePrompt(req, res);
-    if (req.method === 'DELETE' && path.startsWith('/api/prompts/'))
-      return await handleDeletePrompt(req, res);
-    if (req.method === 'GET' && path === '/api/admin/stats')
-      return await handleAdminStats(req, res);
-    if (req.method === 'GET' && path === '/api/stats')
-      return await handlePublicStats(req, res);
-    if (req.method === 'POST' && path === '/api/admin/prompts/bulk-action')
-      return await handleBulkAction(req, res);
-    if (req.method === 'GET' && path === '/')
-      return res.status(200).json({
-        message: 'PromptZen API running with Turso!',
-        status: 'success',
-        database: 'turso',
-      });
-
-    return res.status(404).json({ error: 'Route not found' });
-  } catch (error) {
-    console.error('Server error:', error);
-    return res.status(500).json({ error: 'Internal error: ' + error.message });
-  }
-};
-
-// === Route handlers (same as your original) ===
-// (copy-paste your handleRegister, handleLogin, handleFileUpload, handleGetPrompts,
-// handleGetPendingPrompts, handleCreatePrompt, handleUpdatePrompt,
-// handleDeletePrompt, handleAdminStats, handlePublicStats, handleBulkAction,
-// and parseBody exactly as they are — no changes needed.)
+// Route handlers
 async function handleRegister(req, res) {
   try {
     const { username, password } = await parseBody(req);
@@ -236,10 +259,10 @@ async function handleRegister(req, res) {
     
     // Create user
     const hashedPassword = hashPassword(password);
-    const result = await dbRun(
-      'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
-      [username, hashedPassword, 'user']
-    );
+    await dbExecute({
+      sql: 'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+      args: [username, hashedPassword, 'user']
+    });
     
     // Create token
     const token = jwt.sign(
@@ -359,16 +382,17 @@ async function handleGetPrompts(req, res) {
     const publicOnly = url.searchParams.get('public') !== 'false';
     
     let query = 'SELECT * FROM prompts';
-    let params = [];
+    let args = [];
     
     if (publicOnly) {
       query += ' WHERE accepted = ?';
-      params.push(1);
+      args.push(1);
     }
     
     query += ' ORDER BY created_at DESC';
     
-    const prompts = await dbAll(query, params);
+    const result = await dbExecute({ sql: query, args });
+    const prompts = result.rows;
     
     // Convert for frontend
     const processedPrompts = prompts.map(prompt => ({
@@ -393,10 +417,11 @@ async function handleGetPendingPrompts(req, res) {
       return res.status(403).json({ error: 'Admin access required' });
     }
     
-    const prompts = await dbAll(
-      'SELECT * FROM prompts WHERE accepted = ? ORDER BY created_at DESC',
-      [0]
-    );
+    const result = await dbExecute({
+      sql: 'SELECT * FROM prompts WHERE accepted = ? ORDER BY created_at DESC',
+      args: [0]
+    });
+    const prompts = result.rows;
     
     // Convert for frontend
     const processedPrompts = prompts.map(prompt => ({
@@ -429,22 +454,17 @@ async function handleCreatePrompt(req, res) {
     console.log('Creating prompt for user:', user.username);
     console.log('Prompt data:', { title, tagline, model });
     
-    // ✅ FIXED: Use our custom dbRun that properly returns lastID
-    const result = await dbRun(
-      `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [user.username, title, tagline, model, text, imageData, user.role === 'admin' ? 1 : 0, 0]
-    );
+    const result = await dbExecute({
+      sql: `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [user.username, title, tagline, model, text, imageData, user.role === 'admin' ? 1 : 0, 0]
+    });
     
-    console.log('Insert result:', result);
+    // Get the created prompt (Turso doesn't return lastID directly, so we query for it)
+    const lastInsertResult = await dbExecute('SELECT last_insert_rowid() as id');
+    const promptId = lastInsertResult.rows[0].id;
     
-    // ✅ FIXED: Check if we got a valid lastID
-    if (!result || result.lastID === undefined || result.lastID === null) {
-      throw new Error('Failed to get prompt ID after insertion');
-    }
-    
-    // Get the created prompt
-    const newPrompt = await dbGet('SELECT * FROM prompts WHERE id = ?', [result.lastID]);
+    const newPrompt = await dbGet('SELECT * FROM prompts WHERE id = ?', [promptId]);
     
     if (!newPrompt) {
       throw new Error('Failed to retrieve created prompt');
@@ -501,10 +521,10 @@ async function handleUpdatePrompt(req, res) {
     
     updateValues.push(promptId);
     
-    await dbRun(
-      `UPDATE prompts SET ${updateFields.join(', ')} WHERE id = ?`,
-      updateValues
-    );
+    await dbExecute({
+      sql: `UPDATE prompts SET ${updateFields.join(', ')} WHERE id = ?`,
+      args: updateValues
+    });
     
     const updatedPrompt = await dbGet('SELECT * FROM prompts WHERE id = ?', [promptId]);
     
@@ -536,7 +556,10 @@ async function handleDeletePrompt(req, res) {
     
     const promptId = req.url.split('/').pop();
     
-    await dbRun('DELETE FROM prompts WHERE id = ?', [promptId]);
+    await dbExecute({
+      sql: 'DELETE FROM prompts WHERE id = ?',
+      args: [promptId]
+    });
     
     return res.json({ message: 'Prompt deleted successfully' });
   } catch (error) {
@@ -552,8 +575,10 @@ async function handleAdminStats(req, res) {
       return res.status(403).json({ error: 'Admin access required' });
     }
     
-    const prompts = await dbAll('SELECT * FROM prompts');
-    const users = await dbAll('SELECT username FROM users');
+    const promptsResult = await dbExecute('SELECT * FROM prompts');
+    const prompts = promptsResult.rows;
+    const usersResult = await dbExecute('SELECT username FROM users');
+    const users = usersResult.rows;
     
     const totalPrompts = prompts.length;
     const acceptedPrompts = prompts.filter(p => p.accepted).length;
@@ -575,7 +600,11 @@ async function handleAdminStats(req, res) {
 
 async function handlePublicStats(req, res) {
   try {
-    const prompts = await dbAll('SELECT * FROM prompts WHERE accepted = ?', [1]);
+    const result = await dbExecute({
+      sql: 'SELECT * FROM prompts WHERE accepted = ?',
+      args: [1]
+    });
+    const prompts = result.rows;
     
     const acceptedPrompts = prompts || [];
     const uniqueUsers = new Set(acceptedPrompts.map(p => p.username));
@@ -607,17 +636,16 @@ async function handleBulkAction(req, res) {
       return res.status(400).json({ error: 'Invalid request' });
     }
     
-    let result;
     if (action === 'approve') {
-      result = await dbRun(
-        'UPDATE prompts SET accepted = ? WHERE id IN (' + prompt_ids.map(() => '?').join(',') + ')',
-        [1, ...prompt_ids]
-      );
+      await dbExecute({
+        sql: 'UPDATE prompts SET accepted = ? WHERE id IN (' + prompt_ids.map(() => '?').join(',') + ')',
+        args: [1, ...prompt_ids]
+      });
     } else if (action === 'reject') {
-      result = await dbRun(
-        'DELETE FROM prompts WHERE id IN (' + prompt_ids.map(() => '?').join(',') + ')',
-        prompt_ids
-      );
+      await dbExecute({
+        sql: 'DELETE FROM prompts WHERE id IN (' + prompt_ids.map(() => '?').join(',') + ')',
+        args: prompt_ids
+      });
     }
     
     return res.json({
