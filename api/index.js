@@ -394,7 +394,7 @@ async function handleCreatePrompt(req, res) {
     console.log('Prompt data:', { title, tagline, model });
     
     const result = await dbRun(
-      `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, isTrending) 
+      `INSERT INTO prompts (username, title, tagline, model, text, image_data, accepted, "isTrending") 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
       [user.username, title, tagline, model, text, imageData, user.role === 'admin', false]
     );
